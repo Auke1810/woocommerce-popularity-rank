@@ -1,44 +1,65 @@
 <?php
 /**
- * WooCommerce Popularity Rank Calculator
+ * Plugin Name:       AM Popularity Rank for WooCommerce
+ * Plugin URI:        https://wpmarketingrobot.com/
+ * Description:       Calculates a 0.0–100.0 popularity rank score per product from recent order data and stores it in product meta (_am_popularity_rank_score) for use in feed exports such as Google Merchant Center. Recalculates automatically once a day; no setup required.
+ * Version:           1.0.0
+ * Requires at least: 5.6
+ * Requires PHP:      7.0
+ * Author:            WP Marketing Robot
+ * Author URI:        https://wpmarketingrobot.com/
+ * License:           GPL-2.0-or-later
+ * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain:       am-popularity-rank
  *
- * Calculates a normalized 0.0–100.0 popularity_rank score per product from
- * recent order data and stores it in product meta under `_popularity_rank_score`
- * for later use in feed exports (e.g. Google Merchant Center).
+ * WC requires at least: 6.0
+ * WC tested up to:      9.9
  *
- * Phase 1: script only. No admin UI, no settings page, no feed logic.
- *
- * Usage (snippet loader, WP-CLI, or a custom plugin):
- *
- *     $result = wc_calculate_popularity_ranks();
- *     // or with overrides:
- *     $result = wc_calculate_popularity_ranks( array(
- *         'lookback_days'  => 90,
- *         'order_statuses' => array( 'wc-processing', 'wc-completed', 'wc-on-hold' ),
- *         'revenue_weight' => 0.70,
- *         'qty_weight'     => 0.30,
- *     ) );
- *
- * @package WC_Popularity_Rank
+ * @package AM_Popularity_Rank
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit; // No direct access.
 }
 
-if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
+if ( ! defined( 'AM_POPULARITY_RANK_VERSION' ) ) {
+	define( 'AM_POPULARITY_RANK_VERSION', '1.0.0' );
+}
+
+// Name of the scheduled (WP-Cron) event that recalculates scores.
+if ( ! defined( 'AM_POPULARITY_RANK_CRON_HOOK' ) ) {
+	define( 'AM_POPULARITY_RANK_CRON_HOOK', 'am_popularity_rank_recalculate' );
+}
+
+/**
+ * Declare compatibility with WooCommerce High-Performance Order Storage (HPOS).
+ */
+add_action(
+	'before_woocommerce_init',
+	function () {
+		if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
+			\Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility(
+				'custom_order_tables',
+				__FILE__,
+				true
+			);
+		}
+	}
+);
+
+if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 
 	/**
 	 * Calculates and stores product popularity rank scores.
 	 */
-	class WC_Popularity_Rank_Calculator {
+	class AM_Popularity_Rank_Calculator {
 
 		/**
 		 * Meta key used to store the final score.
 		 *
 		 * @var string
 		 */
-		const META_KEY = '_popularity_rank_score';
+		const META_KEY = '_am_popularity_rank_score';
 
 		/**
 		 * Resolved configuration.
@@ -95,7 +116,7 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 		 * }
 		 */
 		public function calculate() {
-			$sales = $this->collect_sales_data( $orders_scanned );
+			$sales  = $this->collect_sales_data( $orders_scanned );
 			$scores = $this->rank_and_normalize( $sales );
 			$saved  = $this->save_scores( $scores );
 
@@ -110,7 +131,8 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 		 * Collect per-product recent sales metrics from qualifying orders.
 		 *
 		 * Uses wc_get_orders() (HPOS-safe) with pagination. Variation sales are
-		 * rolled up into their parent product id.
+		 * rolled up into their parent product id. WooCommerce object caches are
+		 * flushed between batches to keep memory flat on large stores.
 		 *
 		 * @param int $orders_scanned Passed by reference; set to the order count read.
 		 * @return array Map of product_id => array( 'revenue' => float, 'qty' => float ).
@@ -120,13 +142,14 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 			$orders_scanned = 0;
 			$after          = gmdate( 'Y-m-d H:i:s', time() - ( absint( $this->config['lookback_days'] ) * DAY_IN_SECONDS ) );
 			$page           = 1;
+			$per_page       = absint( $this->config['orders_per_page'] );
 
 			do {
 				$orders = wc_get_orders(
 					array(
 						'status'       => $this->config['order_statuses'],
 						'date_created' => '>=' . $after,
-						'limit'        => absint( $this->config['orders_per_page'] ),
+						'limit'        => $per_page,
 						'paged'        => $page,
 						'orderby'      => 'ID',
 						'order'        => 'ASC',
@@ -170,10 +193,20 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 					}
 				}
 
+				$batch_count = count( $orders );
+
+				// Free the loaded order objects and WooCommerce's runtime caches
+				// so a long run doesn't accumulate memory batch after batch.
+				unset( $orders );
+				if ( function_exists( 'wc_reset_order_data_cache' ) ) {
+					wc_reset_order_data_cache();
+				}
+				am_cache_flush_runtime_safe();
+
 				$page++;
 
 				// Stop when the last page returned fewer than a full batch.
-			} while ( count( $orders ) === absint( $this->config['orders_per_page'] ) );
+			} while ( $batch_count === $per_page );
 
 			return $sales;
 		}
@@ -205,7 +238,7 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 				}
 			}
 
-			$revenues = wp_list_pluck( $sales, 'revenue' );
+			$revenues   = wp_list_pluck( $sales, 'revenue' );
 			$quantities = wp_list_pluck( $sales, 'qty' );
 
 			$max_revenue = max( $revenues );
@@ -237,7 +270,7 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 					}
 				}
 
-				$percentile = ( $at_or_below / $total ) * 100;
+				$percentile            = ( $at_or_below / $total ) * 100;
 				$scores[ $product_id ] = round( $percentile, 1 );
 			}
 
@@ -304,20 +337,30 @@ if ( ! class_exists( 'WC_Popularity_Rank_Calculator' ) ) :
 
 endif;
 
-if ( ! function_exists( 'wc_calculate_popularity_ranks' ) ) :
+if ( ! function_exists( 'am_cache_flush_runtime_safe' ) ) :
+	/**
+	 * Flush the in-memory (runtime) object cache when the backend supports it,
+	 * without wiping a persistent cache. Keeps memory flat during long batch runs.
+	 */
+	function am_cache_flush_runtime_safe() {
+		if ( function_exists( 'wp_cache_flush_runtime' ) ) {
+			wp_cache_flush_runtime();
+		}
+	}
+endif;
+
+if ( ! function_exists( 'am_calculate_popularity_ranks' ) ) :
 
 	/**
 	 * Convenience wrapper: calculate and store popularity ranks in one call.
 	 *
-	 * Intended for manual execution via a code hook, WP-CLI, or a snippet.
-	 * Structured so WP-Cron scheduling can wrap this later, e.g.:
-	 *
-	 *     add_action( 'wc_popularity_rank_cron', 'wc_calculate_popularity_ranks' );
+	 * Intended for WP-CLI, WP-Cron, or a manual trigger. Do NOT call this on a
+	 * normal page load — it reads order history and is meant to run occasionally.
 	 *
 	 * @param array $args Optional configuration overrides.
 	 * @return array|WP_Error Run summary, or WP_Error if WooCommerce is inactive.
 	 */
-	function wc_calculate_popularity_ranks( array $args = array() ) {
+	function am_calculate_popularity_ranks( array $args = array() ) {
 		if ( ! function_exists( 'wc_get_orders' ) ) {
 			return new WP_Error(
 				'woocommerce_inactive',
@@ -325,9 +368,129 @@ if ( ! function_exists( 'wc_calculate_popularity_ranks' ) ) :
 			);
 		}
 
-		$calculator = new WC_Popularity_Rank_Calculator( $args );
+		$calculator = new AM_Popularity_Rank_Calculator( $args );
 
 		return $calculator->calculate();
 	}
 
 endif;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Automatic daily recalculation (WP-Cron)
+ * ---------------------------------------------------------------------------
+ * On activation the plugin schedules a daily event; on deactivation it clears
+ * it. You install, activate, and the scores refresh themselves every day.
+ * No command line and no manual trigger required.
+ */
+
+// Run the calculation when the scheduled event fires.
+add_action( AM_POPULARITY_RANK_CRON_HOOK, 'am_calculate_popularity_ranks' );
+
+register_activation_hook( __FILE__, 'am_popularity_rank_activate' );
+register_deactivation_hook( __FILE__, 'am_popularity_rank_deactivate' );
+
+if ( ! function_exists( 'am_popularity_rank_activate' ) ) :
+	/**
+	 * Schedule the daily recalculation when the plugin is activated.
+	 *
+	 * The first run is queued a minute out so it happens in a background cron
+	 * request, never during the activation request itself.
+	 */
+	function am_popularity_rank_activate() {
+		if ( ! wp_next_scheduled( AM_POPULARITY_RANK_CRON_HOOK ) ) {
+			wp_schedule_event( time() + MINUTE_IN_SECONDS, 'daily', AM_POPULARITY_RANK_CRON_HOOK );
+		}
+	}
+endif;
+
+if ( ! function_exists( 'am_popularity_rank_deactivate' ) ) :
+	/**
+	 * Clear the scheduled recalculation when the plugin is deactivated.
+	 */
+	function am_popularity_rank_deactivate() {
+		wp_clear_scheduled_hook( AM_POPULARITY_RANK_CRON_HOOK );
+	}
+endif;
+
+/*
+ * ---------------------------------------------------------------------------
+ * WP-CLI command
+ * ---------------------------------------------------------------------------
+ * Run the calculation from the command line, where memory limits are higher
+ * and nothing runs on a page load:
+ *
+ *     wp popularity-rank calculate
+ *     wp popularity-rank calculate --lookback_days=180 --log_transform=1
+ *     wp popularity-rank calculate --include_unsold=1
+ */
+if ( defined( 'WP_CLI' ) && WP_CLI ) {
+
+	/**
+	 * Calculate and store WooCommerce product popularity ranks.
+	 */
+	class AM_Popularity_Rank_CLI_Command {
+
+		/**
+		 * Calculate popularity ranks for recently-sold products.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [--lookback_days=<days>]
+		 * : Days of order history to consider. Default 90.
+		 *
+		 * [--revenue_weight=<weight>]
+		 * : Share of the score driven by revenue (0–1). Default 0.70.
+		 *
+		 * [--qty_weight=<weight>]
+		 * : Share of the score driven by quantity (0–1). Default 0.30.
+		 *
+		 * [--include_unsold]
+		 * : Also score products with no recent sales as 0.0.
+		 *
+		 * [--log_transform]
+		 * : Log-soften revenue and quantity before normalizing.
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     wp popularity-rank calculate
+		 *     wp popularity-rank calculate --lookback_days=180 --log_transform
+		 *
+		 * @param array $args       Positional args (unused).
+		 * @param array $assoc_args Named options.
+		 */
+		public function calculate( $args, $assoc_args ) {
+			$config = array();
+
+			if ( isset( $assoc_args['lookback_days'] ) ) {
+				$config['lookback_days'] = absint( $assoc_args['lookback_days'] );
+			}
+			if ( isset( $assoc_args['revenue_weight'] ) ) {
+				$config['revenue_weight'] = (float) $assoc_args['revenue_weight'];
+			}
+			if ( isset( $assoc_args['qty_weight'] ) ) {
+				$config['qty_weight'] = (float) $assoc_args['qty_weight'];
+			}
+			$config['include_unsold'] = isset( $assoc_args['include_unsold'] );
+			$config['log_transform']  = isset( $assoc_args['log_transform'] );
+
+			WP_CLI::log( 'Calculating popularity ranks…' );
+
+			$result = am_calculate_popularity_ranks( $config );
+
+			if ( is_wp_error( $result ) ) {
+				WP_CLI::error( $result->get_error_message() );
+			}
+
+			WP_CLI::success(
+				sprintf(
+					'Scored %d products from %d orders.',
+					$result['products_scored'],
+					$result['orders_scanned']
+				)
+			);
+		}
+	}
+
+	WP_CLI::add_command( 'popularity-rank', 'AM_Popularity_Rank_CLI_Command' );
+}

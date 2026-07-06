@@ -1,200 +1,127 @@
-===========================================================================
- WooCommerce Popularity Rank Calculator
-===========================================================================
+=== AM Popularity Rank for WooCommerce ===
+Contributors: aukejomm
+Requires at least: 5.6
+Tested up to: 6.8
+Requires PHP: 7.0
+WC requires at least: 6.0
+WC tested up to: 9.9
+Stable tag: 1.0.0
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-A single, dependency-free PHP script that calculates a 0.0-100.0
-"popularity rank" score for your WooCommerce products from recent order
-data, and stores it in product meta under `_popularity_rank_score`.
+Calculates a 0.0–100.0 popularity rank score per product from recent order
+data and stores it in product meta (_am_popularity_rank_score) for use in feed
+exports such as Google Merchant Center.
 
-The score is designed to be exported later as a product feed attribute
-(for example Google Merchant Center's popularity_rank), which expects a
-value that reflects a product's popularity relative to your own catalog.
+== Description ==
 
-This is Phase 1: the calculation script only. It does NOT add an admin
-screen, a settings page, a product edit field, or any feed-export logic.
+WooCommerce stores have sales data but no normalized popularity score you can
+export as a product feed attribute. This plugin fills that gap.
 
+It reads recent orders, calculates a recent-sales score per product, and saves
+a value from 0.0 to 100.0 in product meta under `_am_popularity_rank_score`. Your
+feed plugin can then map that meta key to a feed attribute such as Google
+Merchant Center's popularity_rank.
 
----------------------------------------------------------------------------
- WHAT IT DOES
----------------------------------------------------------------------------
+This is a calculation tool only. It does NOT add a settings page or a product
+edit field. After activation it runs itself once a day in the background via
+WP-Cron, so there is nothing to click and nothing to run by hand. It never runs
+during a normal page load, so it does not slow down your storefront or admin.
 
-1. Reads your WooCommerce orders from the last 90 days (configurable).
-   Only orders in these statuses count as a real sale:
-       - Processing   (wc-processing)
-       - Completed    (wc-completed)
-       - On hold      (wc-on-hold)
+How the score works:
 
-2. For every product, it adds up two numbers from those orders:
-       - Recent revenue (net line total, after discounts, excl. tax)
-       - Recent quantity sold
-   Sales from product variations are rolled up into their parent product.
+1. Reads orders from the last 90 days (configurable), counting only
+   processing, completed, and on-hold orders as sales.
+2. Sums recent net revenue and quantity sold per product (variation sales
+   roll up into the parent product).
+3. Normalizes both metrics across the catalog and blends them: 70% revenue,
+   30% quantity.
+4. Percentile-ranks the result so your best seller is 100.0 and everything
+   else is relative to it, rounded to one decimal.
+5. Saves the value using WooCommerce product methods (no direct post meta),
+   so hooks and caches stay consistent.
 
-3. It normalizes both numbers across your whole catalog to a 0-100 scale,
-   then blends them into one raw score:
-       - 70% weight on revenue
-       - 30% weight on quantity
+It is HPOS-safe (works with High-Performance Order Storage and legacy order
+tables) and reads orders in batches, flushing runtime caches between batches
+to keep memory flat on large catalogs.
 
-4. It converts that raw score into a percentile rank across all products
-   that sold. Your best seller lands at 100.0, and everything else is
-   ranked relative to it. The final value is rounded to one decimal.
+== Installation ==
 
-5. It saves the result to each product using WooCommerce's own product
-   methods (wc_get_product -> update_meta_data -> save), so WooCommerce
-   hooks and caches stay consistent. It never writes post meta directly.
+1. Copy the `am-popularity-rank` folder into `wp-content/plugins/`, OR zip the
+   folder and upload it via Plugins → Add New → Upload Plugin.
+2. Activate "AM Popularity Rank for WooCommerce" from the Plugins screen.
+3. Make sure WooCommerce is active.
 
-The script is HPOS-safe (works with WooCommerce's High-Performance Order
-Storage as well as the legacy order tables) and reads orders in batches,
-so it is safe to run on large stores.
+That is all. On activation the plugin schedules a daily background job that
+recalculates every product's score automatically. The first run happens within
+a few minutes (once your site next gets traffic), then once a day after that.
+You do not need to run anything.
 
+Deactivating the plugin removes the scheduled job again.
 
----------------------------------------------------------------------------
- REQUIREMENTS
----------------------------------------------------------------------------
+== Running it manually (optional) ==
 
-- WordPress with WooCommerce active.
-- PHP 7.0 or newer.
-- A way to run a bit of PHP: a code snippets plugin, a small custom
-  plugin, WP-CLI, or a functions.php include.
+You normally never need this, but if you want to force a recalculation right
+now, you can:
 
+Via WP-CLI (if your host provides it):
 
----------------------------------------------------------------------------
- INSTALLATION
----------------------------------------------------------------------------
+    wp popularity-rank calculate
+    wp popularity-rank calculate --lookback_days=180 --log_transform
+    wp popularity-rank calculate --include_unsold
 
-Pick ONE of these:
+Via PHP (your own code or a scheduled task — never on a page load):
 
-A) Code snippets plugin (easiest)
-   Paste the entire contents of woocommerce-popularity-rank.php into a new
-   PHP snippet and activate it. This makes the function available; it does
-   not run the calculation on its own.
+    $result = am_calculate_popularity_ranks();
+    // => array( 'products_scored' => 42, 'orders_scanned' => 310, 'scores' => [...] )
 
-B) Custom plugin
-   Drop woocommerce-popularity-rank.php into a plugin folder (or require it
-   from your plugin's main file):
-       require_once __DIR__ . '/woocommerce-popularity-rank.php';
+It is safe to run repeatedly. Each run overwrites the single stored value per
+product and never creates duplicate data.
 
-C) functions.php
-   Add to your child theme's functions.php:
-       require_once get_stylesheet_directory() . '/woocommerce-popularity-rank.php';
+== A note on WP-Cron ==
 
-Loading the file only DEFINES the function. Nothing is calculated until
-you actually call it (see below).
+WordPress's built-in cron fires on site visits, so the daily job runs shortly
+after the scheduled time as soon as someone visits your site. On a store with
+normal traffic this is completely fine and requires no setup.
 
+If your store is very large, or you want the job to run at an exact time
+regardless of traffic, point a real server cron at WP-Cron instead. That is an
+optional hosting-level tweak, not required for the plugin to work.
 
----------------------------------------------------------------------------
- HOW TO RUN IT
----------------------------------------------------------------------------
+== Options ==
 
-Call the function once to score every recently-sold product:
+Pass these as WP-CLI flags or as an array to am_calculate_popularity_ranks():
 
-    $result = wc_calculate_popularity_ranks();
+* lookback_days   – Days of order history to consider. Default 90.
+* order_statuses  – Which statuses count as a sale. Default processing,
+                    completed, on-hold. (PHP array only.)
+* revenue_weight  – Share of the score from revenue. Default 0.70.
+* qty_weight      – Share of the score from quantity. Default 0.30.
+* include_unsold  – Score products with no recent sales as 0.0. Default off.
+* log_transform   – Log-soften revenue and quantity before normalizing, for
+                    catalogs where a few products dominate. Default off.
 
-It returns a small summary array:
+== Reading the score back ==
 
-    array(
-        'products_scored' => 42,     // products that received a score
-        'orders_scanned'  => 310,    // orders read
-        'scores'          => array(  // product_id => score, for checking
-            123 => 100.0,
-            456 => 72.4,
-            ...
-        ),
-    );
-
-If WooCommerce is not active it returns a WP_Error instead.
-
-It is safe to run repeatedly. Each run overwrites the single stored value
-per product; it never creates duplicate data.
-
-Run it with WP-CLI (no code changes needed):
-
-    wp eval 'print_r( wc_calculate_popularity_ranks() );'
-
-
----------------------------------------------------------------------------
- OPTIONS
----------------------------------------------------------------------------
-
-Pass an array to override any default:
-
-    $result = wc_calculate_popularity_ranks( array(
-        'lookback_days'  => 90,
-        'order_statuses' => array( 'wc-processing', 'wc-completed', 'wc-on-hold' ),
-        'revenue_weight' => 0.70,
-        'qty_weight'     => 0.30,
-        'include_unsold' => false,
-        'log_transform'  => false,
-    ) );
-
-  lookback_days   How many days of order history to consider. Default 90.
-
-  order_statuses  Which order statuses count as a sale. Default is
-                  processing, completed, and on-hold.
-
-  revenue_weight  Share of the raw score driven by revenue. Default 0.70.
-  qty_weight      Share driven by quantity sold. Default 0.30.
-                  (These two should add up to 1.0.)
-
-  include_unsold  false (default): products with no recent sales are
-                  skipped and keep whatever score they already had.
-                  true: every published product with no recent sales is
-                  scored 0.0.
-
-  log_transform   false (default): scoring behaves exactly as described
-                  above.
-                  true: revenue and quantity are log-softened before
-                  normalizing. Use this if your catalog has a few
-                  blockbuster products that push everything else near the
-                  bottom, and you want smoother spread across 0-100.
-                  It has little effect on catalogs with even sales.
-
-
----------------------------------------------------------------------------
- READING THE SCORE BACK
----------------------------------------------------------------------------
-
-The value is stored in product meta under `_popularity_rank_score` as a
-decimal string with one decimal place, e.g. "72.4".
-
-In PHP:
+Stored in product meta under `_am_popularity_rank_score` as a one-decimal string,
+e.g. "72.4".
 
     $product = wc_get_product( $product_id );
-    $score   = $product->get_meta( '_popularity_rank_score' );
+    $score   = $product->get_meta( '_am_popularity_rank_score' );
 
-A feed plugin can be pointed at the `_popularity_rank_score` meta key to
-map it to a custom feed attribute.
+Point your feed plugin at the `_am_popularity_rank_score` meta key to map it to a
+custom feed attribute.
 
+== Notes on the score ==
 
----------------------------------------------------------------------------
- RUNNING IT AUTOMATICALLY (LATER)
----------------------------------------------------------------------------
+The score is relative to your current catalog and time window. It reflects how
+popular a product is compared to your other products right now, which is what a
+popularity feed attribute is meant to convey. Re-run on a schedule to keep the
+values current.
 
-The script is built so scheduling can be bolted on without changes. For a
-daily refresh, register a WP-Cron event that calls the function:
+== Changelog ==
 
-    // Schedule once (e.g. on plugin activation).
-    if ( ! wp_next_scheduled( 'wc_popularity_rank_cron' ) ) {
-        wp_schedule_event( time(), 'daily', 'wc_popularity_rank_cron' );
-    }
-
-    // Run the calculation when the event fires.
-    add_action( 'wc_popularity_rank_cron', 'wc_calculate_popularity_ranks' );
-
-
----------------------------------------------------------------------------
- NOTES ON THE SCORE
----------------------------------------------------------------------------
-
-The score is RELATIVE to your current catalog and the chosen time window.
-It reflects how popular a product is compared to your other products right
-now, which is exactly what a popularity feed attribute is meant to convey.
-As sales patterns shift, scores shift with them. Re-run on a schedule to
-keep the values current.
-
-
----------------------------------------------------------------------------
- FILES
----------------------------------------------------------------------------
-
-  woocommerce-popularity-rank.php   The calculator (this readme accompanies it).
-  readme.txt                        This file.
+= 1.0.0 =
+* Initial release. Recent-sales popularity scoring, automatic daily
+  recalculation via WP-Cron, HPOS support, optional WP-CLI command, and
+  optional log-transform and include-unsold modes.
