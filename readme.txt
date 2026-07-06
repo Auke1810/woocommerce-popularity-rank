@@ -5,7 +5,7 @@ Tested up to: 6.8
 Requires PHP: 7.0
 WC requires at least: 6.0
 WC tested up to: 9.9
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -41,9 +41,13 @@ How the score works:
 5. Saves the value using WooCommerce product methods (no direct post meta),
    so hooks and caches stay consistent.
 
-It is HPOS-safe (works with High-Performance Order Storage and legacy order
-tables) and reads orders in batches, flushing runtime caches between batches
-to keep memory flat on large catalogs.
+Built for large catalogs. When WooCommerce Analytics is enabled (the default),
+the plugin reads its lookup tables with a single aggregate SQL query instead of
+loading thousands of order objects, so it stays fast and light on memory. If
+Analytics is unavailable or not yet populated, it automatically falls back to a
+batched, HPOS-safe scan of order objects (works with High-Performance Order
+Storage and legacy order tables), flushing caches between batches to keep
+memory flat.
 
 == Installation ==
 
@@ -69,6 +73,7 @@ Via WP-CLI (if your host provides it):
     wp popularity-rank calculate
     wp popularity-rank calculate --lookback_days=180 --log_transform
     wp popularity-rank calculate --include_unsold
+    wp popularity-rank calculate --no_lookup   (force the slower per-order scan)
 
 Via PHP (your own code or a scheduled task — never on a page load):
 
@@ -100,6 +105,9 @@ Pass these as WP-CLI flags or as an array to am_calculate_popularity_ranks():
 * include_unsold  – Score products with no recent sales as 0.0. Default off.
 * log_transform   – Log-soften revenue and quantity before normalizing, for
                     catalogs where a few products dominate. Default off.
+* force_order_scan – Skip the Analytics lookup tables and scan order objects
+                    instead (WP-CLI: --no_lookup). Mainly for debugging.
+                    Default off.
 
 == Reading the score back ==
 
@@ -121,7 +129,21 @@ values current.
 
 == Changelog ==
 
+= 1.0.1 =
+* New primary data source: WooCommerce Analytics lookup tables
+  (wc_order_product_lookup + wc_order_stats). Scores are now aggregated with a
+  single GROUP BY query instead of loading order objects, which is far faster
+  and lighter on memory on large catalogs.
+* Automatic fallback to the batched, HPOS-safe order scan when Analytics is
+  disabled, missing, or not yet populated, so results stay correct everywhere.
+* Added the force_order_scan option (WP-CLI: --no_lookup) to force the order
+  scan, for debugging and comparing the two data sources.
+* The run summary and WP-CLI output now report which data source was used.
+* Table-existence checks are escaped with esc_like() and all queries run
+  through $wpdb->prepare().
+
 = 1.0.0 =
-* Initial release. Recent-sales popularity scoring, automatic daily
-  recalculation via WP-Cron, HPOS support, optional WP-CLI command, and
-  optional log-transform and include-unsold modes.
+* Initial release. Recent-sales popularity scoring via WooCommerce Analytics
+  lookup tables (single aggregate query) with automatic fallback to a batched,
+  HPOS-safe order scan. Automatic daily recalculation via WP-Cron, optional
+  WP-CLI command, and optional log-transform and include-unsold modes.

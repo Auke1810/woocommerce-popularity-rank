@@ -3,7 +3,7 @@
  * Plugin Name:       AM Popularity Rank for WooCommerce
  * Plugin URI:        https://wpmarketingrobot.com/
  * Description:       Calculates a 0.0–100.0 popularity rank score per product from recent order data and stores it in product meta (_am_popularity_rank_score) for use in feed exports such as Google Merchant Center. Recalculates automatically once a day; no setup required.
- * Version:           1.0.0
+ * Version:           1.0.1
  * Requires at least: 5.6
  * Requires PHP:      7.0
  * Author:            WP Marketing Robot
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'AM_POPULARITY_RANK_VERSION' ) ) {
-	define( 'AM_POPULARITY_RANK_VERSION', '1.0.0' );
+	define( 'AM_POPULARITY_RANK_VERSION', '1.0.1' );
 }
 
 // Name of the scheduled (WP-Cron) event that recalculates scores.
@@ -69,6 +69,13 @@ if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 		protected $config;
 
 		/**
+		 * Which data source the last run used: 'analytics_lookup' or 'order_scan'.
+		 *
+		 * @var string
+		 */
+		protected $last_method = '';
+
+		/**
 		 * @param array $args Optional configuration overrides.
 		 */
 		public function __construct( array $args = array() ) {
@@ -88,8 +95,12 @@ if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 				// dominate sales, giving the percentile buckets more gradation.
 				// Off by default so scoring behaviour is unchanged unless enabled.
 				'log_transform'   => false,
-				// How many orders to load per batch (memory safety).
+				// How many orders to load per batch in the fallback order scan.
 				'orders_per_page' => 200,
+				// Force the slower per-order scan even when the WooCommerce
+				// Analytics lookup tables are available. Mainly for debugging;
+				// leave false so large catalogs use the fast SQL aggregation.
+				'force_order_scan' => false,
 			);
 
 			$this->config = wp_parse_args( $args, $defaults );
@@ -110,9 +121,10 @@ if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 		 * @return array {
 		 *     Summary of the run.
 		 *
-		 *     @type int   $products_scored Number of products that received a score.
-		 *     @type int   $orders_scanned  Number of orders read.
-		 *     @type array $scores          Map of product_id => score (for logging/testing).
+		 *     @type int    $products_scored Number of products that received a score.
+		 *     @type int    $orders_scanned  Number of orders read.
+		 *     @type string $method          Data source used ('analytics_lookup' or 'order_scan').
+		 *     @type array  $scores          Map of product_id => score (for logging/testing).
 		 * }
 		 */
 		public function calculate() {
@@ -123,12 +135,143 @@ if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 			return array(
 				'products_scored' => $saved,
 				'orders_scanned'  => (int) $orders_scanned,
+				'method'          => $this->last_method,
 				'scores'          => $scores,
 			);
 		}
 
 		/**
-		 * Collect per-product recent sales metrics from qualifying orders.
+		 * Collect per-product recent sales metrics.
+		 *
+		 * Prefers the WooCommerce Analytics lookup tables (a single aggregate
+		 * SQL query, very light on memory) and falls back to a paginated scan of
+		 * order objects when Analytics is unavailable or not yet populated.
+		 *
+		 * @param int $orders_scanned Passed by reference; set to the order count read.
+		 * @return array Map of product_id => array( 'revenue' => float, 'qty' => float ).
+		 */
+		protected function collect_sales_data( &$orders_scanned = 0 ) {
+			if ( $this->lookup_tables_available() ) {
+				$this->last_method = 'analytics_lookup';
+				return $this->collect_sales_data_from_lookup( $orders_scanned );
+			}
+
+			$this->last_method = 'order_scan';
+			return $this->collect_sales_data_from_orders( $orders_scanned );
+		}
+
+		/**
+		 * Are WooCommerce Analytics lookup tables present and populated?
+		 *
+		 * Requires both wc_order_product_lookup (per-item metrics) and
+		 * wc_order_stats (per-order status). Returns false when 'force_order_scan'
+		 * is set, when either table is missing, or when the lookup table is empty
+		 * (Analytics disabled or history never synced) so we fall back cleanly.
+		 *
+		 * @return bool
+		 */
+		protected function lookup_tables_available() {
+			if ( ! empty( $this->config['force_order_scan'] ) ) {
+				return false;
+			}
+
+			global $wpdb;
+
+			$lookup = $wpdb->prefix . 'wc_order_product_lookup';
+			$stats  = $wpdb->prefix . 'wc_order_stats';
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery
+			$has_lookup = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $lookup ) ) ) === $lookup;
+			$has_stats  = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $stats ) ) ) === $stats;
+
+			if ( ! $has_lookup || ! $has_stats ) {
+				return false;
+			}
+
+			// Treat a completely empty lookup table as "not usable" so a store
+			// with real orders but un-synced Analytics still gets scored.
+			$has_rows = $wpdb->get_var( "SELECT order_item_id FROM {$lookup} LIMIT 1" );
+			// phpcs:enable
+
+			return ! empty( $has_rows );
+		}
+
+		/**
+		 * Collect per-product metrics from the Analytics lookup tables.
+		 *
+		 * One GROUP BY query aggregates quantity and net revenue per product over
+		 * qualifying orders in the window. Grouping by lookup.product_id rolls
+		 * variation sales up into their parent, matching the order-scan path.
+		 *
+		 * @param int $orders_scanned Passed by reference; set to the distinct order count.
+		 * @return array Map of product_id => array( 'revenue' => float, 'qty' => float ).
+		 */
+		protected function collect_sales_data_from_lookup( &$orders_scanned = 0 ) {
+			global $wpdb;
+
+			$sales          = array();
+			$orders_scanned = 0;
+
+			$lookup   = $wpdb->prefix . 'wc_order_product_lookup';
+			$stats    = $wpdb->prefix . 'wc_order_stats';
+			$statuses = array_values( $this->config['order_statuses'] );
+			$after    = gmdate( 'Y-m-d H:i:s', time() - ( absint( $this->config['lookback_days'] ) * DAY_IN_SECONDS ) );
+
+			if ( empty( $statuses ) ) {
+				return $sales;
+			}
+
+			$placeholders = implode( ', ', array_fill( 0, count( $statuses ), '%s' ) );
+			$params       = array_merge( $statuses, array( $after ) );
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery, WordPress.DB.PreparedSQLPlaceholders
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT lookup.product_id AS product_id,
+							SUM(lookup.product_qty) AS qty,
+							SUM(lookup.product_net_revenue) AS revenue
+					 FROM {$lookup} AS lookup
+					 INNER JOIN {$stats} AS stats ON lookup.order_id = stats.order_id
+					 WHERE stats.status IN ( {$placeholders} )
+					   AND lookup.date_created >= %s
+					 GROUP BY lookup.product_id",
+					$params
+				)
+			);
+
+			$orders_scanned = (int) $wpdb->get_var(
+				$wpdb->prepare(
+					"SELECT COUNT(DISTINCT lookup.order_id)
+					 FROM {$lookup} AS lookup
+					 INNER JOIN {$stats} AS stats ON lookup.order_id = stats.order_id
+					 WHERE stats.status IN ( {$placeholders} )
+					   AND lookup.date_created >= %s",
+					$params
+				)
+			);
+			// phpcs:enable
+
+			if ( empty( $rows ) ) {
+				return $sales;
+			}
+
+			foreach ( $rows as $row ) {
+				$product_id = (int) $row->product_id;
+				if ( ! $product_id ) {
+					continue;
+				}
+
+				$sales[ $product_id ] = array(
+					'revenue' => (float) $row->revenue,
+					'qty'     => (float) $row->qty,
+				);
+			}
+
+			return $sales;
+		}
+
+		/**
+		 * Collect per-product metrics by scanning order objects (fallback).
 		 *
 		 * Uses wc_get_orders() (HPOS-safe) with pagination. Variation sales are
 		 * rolled up into their parent product id. WooCommerce object caches are
@@ -137,7 +280,7 @@ if ( ! class_exists( 'AM_Popularity_Rank_Calculator' ) ) :
 		 * @param int $orders_scanned Passed by reference; set to the order count read.
 		 * @return array Map of product_id => array( 'revenue' => float, 'qty' => float ).
 		 */
-		protected function collect_sales_data( &$orders_scanned = 0 ) {
+		protected function collect_sales_data_from_orders( &$orders_scanned = 0 ) {
 			$sales          = array();
 			$orders_scanned = 0;
 			$after          = gmdate( 'Y-m-d H:i:s', time() - ( absint( $this->config['lookback_days'] ) * DAY_IN_SECONDS ) );
@@ -451,6 +594,9 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 		 * [--log_transform]
 		 * : Log-soften revenue and quantity before normalizing.
 		 *
+		 * [--no_lookup]
+		 * : Force the slower per-order scan instead of the Analytics lookup tables.
+		 *
 		 * ## EXAMPLES
 		 *
 		 *     wp popularity-rank calculate
@@ -471,8 +617,9 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			if ( isset( $assoc_args['qty_weight'] ) ) {
 				$config['qty_weight'] = (float) $assoc_args['qty_weight'];
 			}
-			$config['include_unsold'] = isset( $assoc_args['include_unsold'] );
-			$config['log_transform']  = isset( $assoc_args['log_transform'] );
+			$config['include_unsold']   = isset( $assoc_args['include_unsold'] );
+			$config['log_transform']    = isset( $assoc_args['log_transform'] );
+			$config['force_order_scan'] = isset( $assoc_args['no_lookup'] );
 
 			WP_CLI::log( 'Calculating popularity ranks…' );
 
@@ -482,11 +629,16 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				WP_CLI::error( $result->get_error_message() );
 			}
 
+			$source = ( 'analytics_lookup' === $result['method'] )
+				? 'WooCommerce Analytics lookup tables'
+				: 'per-order scan';
+
 			WP_CLI::success(
 				sprintf(
-					'Scored %d products from %d orders.',
+					'Scored %d products from %d orders via the %s.',
 					$result['products_scored'],
-					$result['orders_scanned']
+					$result['orders_scanned'],
+					$source
 				)
 			);
 		}
